@@ -1,1 +1,19 @@
-# placeholder
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+build/
+dist/
+*.spec.bak
+config.ini
+*.log
+zapret-log-*.txt
+.DS_Store
+Thumbs.db
+zapret-src/
+*.zip
+*.zip.sha256
+.presets-cache/

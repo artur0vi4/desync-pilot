@@ -1,0 +1,35 @@
+# targets.txt — цели для теста стратегий Desync Pilot
+#
+# Формат:
+#   KeyName = "https://host..."   -> HTTPS-проверка (TCP + TLS + HTTP)
+#   KeyName = "PING:1.2.3.4"      -> игнорируется (ICMP ничего не говорит о DPI)
+#
+# Первые четыре цели — «канарейки»: они должны покрывать разные сервисы,
+# чтобы быстрый подбор сразу видел, что стратегия работает не только на Discord.
+# Ключ — одно слово (буквы/цифры/подчёркивание).
+
+### Канарейки (разные сервисы)
+DiscordMain           = "https://discord.com"
+YouTubeWeb            = "https://www.youtube.com"
+GoogleMain            = "https://www.google.com"
+CloudflareWeb         = "https://www.cloudflare.com"
+
+### Discord
+DiscordGateway        = "https://gateway.discord.gg"
+DiscordCDN            = "https://cdn.discordapp.com"
+DiscordUpdates        = "https://updates.discord.com"
+
+### YouTube
+YouTubeShort          = "https://youtu.be"
+YouTubeImage          = "https://i.ytimg.com"
+YouTubeVideoRedirect  = "https://redirector.googlevideo.com"
+
+### Google / Cloudflare
+GoogleGstatic         = "https://www.gstatic.com"
+CloudflareCDN         = "https://cdnjs.cloudflare.com"
+
+### Public DNS (PING-only, не участвуют в тесте)
+CloudflareDNS1111     = "PING:1.1.1.1"
+CloudflareDNS1001     = "PING:1.0.0.1"
+GoogleDNS8888         = "PING:8.8.8.8"
+GoogleDNS8844         = "PING:8.8.4.4"
