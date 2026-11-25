@@ -16,10 +16,10 @@ from typing import Callable, Optional
 
 from .. import paths
 from ..logger import get as _log
-
-_log = _log()
 from .resolver import test_servers
 from .servers import DNSServer, SERVERS
+
+_log = _log()
 
 CACHE_TTL_SECONDS = 6 * 3600.0
 

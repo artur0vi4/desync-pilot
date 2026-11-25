@@ -1,0 +1,13 @@
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Bug-focused rules only, pinned so results are stable across ruff versions.
+# Style-opinion groups (UP/BLE/SIM/...) are intentionally not selected: the
+# existing codebase predates them and is left as-is.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true

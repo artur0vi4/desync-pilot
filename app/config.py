@@ -14,6 +14,16 @@ _log = _log()
 SECTION = "desyncpilot"
 LEGACY_SECTION = "zapret"  # configs written before the rename
 
+# (min, max, default) for numeric settings read from config.ini. A value out
+# of range logs a warning and falls back to the default — a hand-edited or
+# upgraded config.ini must never crash the app or bind a privileged port.
+_INT_BOUNDS: dict[str, tuple[int, int, int]] = {
+    "dns_listen_port": (1024, 65535, 5354),   # unprivileged range only
+    "test_timeout_seconds": (1, 120, 8),      # per-probe HTTP timeout
+    "test_attempts": (1, 10, 2),              # retries per target
+    "quick_scan_limit": (1, 1000, 40),        # presets the quick pass may try
+}
+
 
 @dataclass
 class Config:
@@ -78,10 +88,28 @@ class Config:
                     try:
                         c.__dict__[k] = int(v)
                     except (TypeError, ValueError):
-                        pass
+                        pass  # keep the default, _validate() logs nothing here
                 else:
                     c.__dict__[k] = v
+        c._validate()
         return c
+
+    def _validate(self) -> None:
+        """Check bounds of externally-supplied numeric values.
+
+        Anything out of range (or of the wrong type) is replaced by the
+        documented default with a warning in the log — the app must stay
+        runnable on a config.ini written by hand or by an older version.
+        """
+        for key, (lo, hi, default) in _INT_BOUNDS.items():
+            value = getattr(self, key, default)
+            if (not isinstance(value, int) or isinstance(value, bool)
+                    or not lo <= value <= hi):
+                _log.warning(
+                    "config: %s=%r is out of range %d..%d — using default %d",
+                    key, value, lo, hi, default,
+                )
+                setattr(self, key, default)
 
 
 def _default_path() -> Path:

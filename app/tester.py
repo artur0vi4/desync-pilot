@@ -12,16 +12,15 @@ The caller receives a sorted list of StrategyResult. Every long step honours a
 """
 from __future__ import annotations
 
-import socket
-import ssl
+import random
 import threading
 import time
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+
+import httpx
 
 from . import paths
 from .strategies import Strategy, StrategyRunner
@@ -49,9 +48,37 @@ DEFAULT_TARGETS: list[tuple[str, float]] = [
 
 # A direct HTTPS request that must not inherit a system/user proxy: with a
 # proxy configured in WinINET every probe would "succeed" against the proxy
-# and the score would be meaningless.
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# and the score would be meaningless. In httpx that is `trust_env=False`.
+_HEADERS = {"User-Agent": "desync-pilot"}
 _OK_HTTP_CODES = (200, 301, 302, 303, 307, 308, 401, 403, 404)
+
+# Retries between failed attempts back off exponentially with jitter (see
+# _probe_target): a CDN that just rate-limited us needs a cool-down, and
+# identical retry intervals from several threads line up into new
+# rate-limit windows instead of spreading out.
+_RETRY_BASE_DELAY = 0.5  # seconds before the 2nd attempt
+_RETRY_MAX_DELAY = 4.0   # cap for the exponential part; jitter adds up to +0.5
+
+_CLIENT: Optional[httpx.Client] = None
+_CLIENT_LOCK = threading.Lock()
+
+
+def _get_client(timeout: float = 5.0) -> httpx.Client:
+    """Shared httpx.Client — one connection pool for every probe thread.
+
+    Created lazily (importing this module must not touch the network) and
+    reused across strategies: keep-alive keeps the measured RTT close to the
+    real round trip instead of paying TCP+TLS setup on every attempt.
+    """
+    global _CLIENT
+    with _CLIENT_LOCK:
+        if _CLIENT is None:
+            _CLIENT = httpx.Client(
+                timeout=timeout,
+                follow_redirects=True,
+                trust_env=False,  # never inherit a system/user proxy
+            )
+        return _CLIENT
 
 
 CANARY_COUNT = 4
@@ -123,17 +150,23 @@ def _probe(url: str, timeout: float = 5.0) -> TargetResult:
     """HTTPS GET (small read) — measures full TCP+TLS+HTTP round trip."""
     t0 = time.perf_counter()
     try:
-        req = urllib.request.Request(url, method="GET", headers={"User-Agent": "desync-pilot"})
-        with _OPENER.open(req, timeout=timeout) as r:
-            r.read(1024)
-        return TargetResult(url, True, (time.perf_counter() - t0) * 1000.0)
-    except urllib.error.HTTPError as e:
-        # 4xx/5xx still means the TLS path works (DPI didn't reset)
-        rtt = (time.perf_counter() - t0) * 1000.0
-        if e.code in _OK_HTTP_CODES:
+        client = _get_client(timeout)
+        with client.stream("GET", url, headers=_HEADERS, timeout=timeout) as r:
+            for _chunk in r.iter_bytes(1024):
+                break  # one small chunk is enough to measure the round trip
+            rtt = (time.perf_counter() - t0) * 1000.0
+        if r.status_code in _OK_HTTP_CODES:
+            # 4xx/5xx from our list still means the TLS path works (DPI didn't reset)
             return TargetResult(url, True, rtt)
-        return TargetResult(url, False, rtt, f"HTTP {e.code}")
-    except (urllib.error.URLError, socket.timeout, OSError, ssl.SSLError) as e:
+        return TargetResult(url, False, rtt, f"HTTP {r.status_code}")
+    except httpx.TimeoutException:
+        # covers ConnectTimeout, ReadTimeout, WriteTimeout, PoolTimeout
+        return TargetResult(url, False, (time.perf_counter() - t0) * 1000.0, "timeout")
+    except httpx.ConnectError:
+        # DNS failure, TCP reset, TLS handshake reset — the typical DPI kill
+        return TargetResult(url, False, (time.perf_counter() - t0) * 1000.0, "connection failed")
+    except httpx.HTTPError as e:
+        # any other transport/protocol error httpx can raise
         return TargetResult(url, False, (time.perf_counter() - t0) * 1000.0, type(e).__name__)
 
 
@@ -179,7 +212,8 @@ class StrategyTester:
     def _probe_target(self, url: str, weight: float, cancel: Optional[threading.Event],
                       attempts: Optional[int] = None) -> TargetResult:
         last: TargetResult = TargetResult(url, False, 0.0, "no attempts", weight)
-        for _ in range(attempts if attempts is not None else self._attempts):
+        total = attempts if attempts is not None else self._attempts
+        for i in range(total):
             if cancel is not None and cancel.is_set():
                 last.error = "cancelled"
                 return last
@@ -188,6 +222,15 @@ class StrategyTester:
             last = tr
             if tr.ok:
                 return tr
+            if i < total - 1:
+                # Exponential backoff with jitter before the next attempt: an
+                # immediate retry often lands inside the same CDN rate-limit
+                # window (Cloudflare) and fails again, and without jitter all
+                # probe threads retry in lockstep. Honours `cancel`.
+                delay = min(_RETRY_BASE_DELAY * (2 ** i), _RETRY_MAX_DELAY)
+                if not _sleep(delay + random.uniform(0.0, _RETRY_BASE_DELAY), cancel):
+                    last.error = "cancelled"
+                    return last
         return last
 
     def _probe_many(self, pairs: Iterable[tuple[str, float]], cancel: Optional[threading.Event],

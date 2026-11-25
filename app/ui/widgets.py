@@ -102,8 +102,8 @@ class Card(QFrame):
     def addWidget(self, w: QWidget) -> None:  # type: ignore[override]
         self._layout.addWidget(w)
 
-    def addLayout(self, l) -> None:
-        self._layout.addLayout(l)
+    def addLayout(self, layout) -> None:
+        self._layout.addLayout(layout)
 
     def addStretch(self) -> None:
         self._layout.addStretch()

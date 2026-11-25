@@ -1,0 +1,5 @@
+# Dev/test tooling — not needed to run the app, install with:
+#   pip install -r requirements.txt -r requirements-dev.txt
+pytest>=8
+mypy>=1.10
+ruff>=0.6

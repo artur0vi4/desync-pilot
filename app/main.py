@@ -79,6 +79,21 @@ def _single_instance() -> bool:
         return True
 
 
+def _escape_arg(arg: str) -> str:
+    """Escape one argument for a Windows command line.
+
+    ShellExecuteW re-splits lpParameters with the usual CRT rules, so an
+    argument containing spaces or quotes must be wrapped in quotes with its
+    inner quotes escaped. The naive `" ".join(f'"{p}"' for p in params)`
+    corrupts any argument that itself contains a quote character.
+    """
+    if not arg:
+        return '""'
+    if " " not in arg and '"' not in arg:
+        return arg
+    return '"' + arg.replace('"', '\\"') + '"'
+
+
 def _relaunch_as_admin(argv: list[str]) -> int:
     """On Windows: relaunch self elevated via ShellExecuteW runas verb.
 
@@ -96,7 +111,7 @@ def _relaunch_as_admin(argv: list[str]) -> int:
             # Dev mode: `python -m app.main` — elevating python.exe without
             # the -m flag would just open a bare interpreter.
             exe, params = sys.executable, ["-m", "app.main", *argv]
-        cmdline = " ".join(f'"{p}"' for p in params)
+        cmdline = " ".join(_escape_arg(p) for p in params)
         rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, cmdline, os.getcwd(), 1)
         if int(rc) <= 32:
             # 5 = access denied, i.e. the user dismissed the UAC prompt
