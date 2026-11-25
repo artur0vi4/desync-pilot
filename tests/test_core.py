@@ -171,7 +171,8 @@ class ConfigTests(unittest.TestCase):
                                     skip_groups=["experimental", "alt"], dns_listen_port=5444,
                                     autostart_windows=True,
                                     doh_custom_url="https://dns.example/dns-query",
-                                    quick_scan=False, quick_scan_limit=12)
+                                    quick_scan=False, quick_scan_limit=12,
+                                    ask_on_found=False, ask_found_timeout_seconds=60)
             app_config.save(cfg, path)
             loaded = app_config.load(path)
         self.assertEqual(loaded.language, "en")
@@ -182,6 +183,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(loaded.doh_custom_url, "https://dns.example/dns-query")
         self.assertFalse(loaded.quick_scan)
         self.assertEqual(loaded.quick_scan_limit, 12)
+        self.assertFalse(loaded.ask_on_found)
+        self.assertEqual(loaded.ask_found_timeout_seconds, 60)
 
     def test_defaults_created_when_missing(self):
         with tempfile.TemporaryDirectory() as td:
@@ -190,6 +193,8 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(path.exists())
         self.assertTrue(cfg.autostart_on_launch)
         self.assertEqual(cfg.results_ttl_minutes, 360)
+        self.assertTrue(cfg.ask_on_found)
+        self.assertEqual(cfg.ask_found_timeout_seconds, 45)
 
 
 class LoggerTests(unittest.TestCase):

@@ -17,3 +17,4 @@ zapret-src/
 *.zip
 *.zip.sha256
 .presets-cache/
+desyncpilot/

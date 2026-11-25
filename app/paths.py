@@ -103,6 +103,11 @@ def state_file() -> Path:
     return user_data_dir() / "state.json"
 
 
+def dns_recommend_file() -> Path:
+    """Cached DNS recommendation (fastest public resolver)."""
+    return user_data_dir() / "dns_recommend.json"
+
+
 def updated_strategies_path() -> Path:
     """Where strategies downloaded by the updater are stored."""
     return user_data_dir() / "strategies_remote.json"

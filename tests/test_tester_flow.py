@@ -129,6 +129,75 @@ class TesterFlowTests(unittest.TestCase):
         self.assertEqual(seen, ["a", "b"])  # stopped after the first full pass
         self.assertEqual(results[0].strategy.id, "b")
 
+    def test_quick_scan_on_pass_decides_stop_or_continue(self):
+        tester, runner = self._tester()
+
+        def fake_test_one(strategy, settle_ms=800, cancel=None, canary_only=False):
+            ok = strategy.id in ("b", "c")
+            return StrategyResult(strategy=strategy, score=100.0 if ok else 0.0,
+                                  targets=[TargetResult("https://a", ok, 10.0)])
+
+        with mock.patch.object(tester, "test_one", fake_test_one), \
+             mock.patch("app.strategies.preflight_check", lambda s: []):
+            # "keep searching" -> the scan walks the rest of the catalog
+            seen: list[str] = []
+            tester.quick_scan([_strategy(x) for x in "abcd"], max_scan=10,
+                              stop_on_pass=False,
+                              on_pass=lambda r: seen.append(r.strategy.id) or False)
+            self.assertEqual(seen, ["b", "c"])  # every pass asked, scan continued
+
+            # "accept" -> the scan stops at the first pass
+            seen2: list[str] = []
+            results = tester.quick_scan([_strategy(x) for x in "abcd"], max_scan=10,
+                                        stop_on_pass=False,
+                                        on_pass=lambda r: seen2.append(r.strategy.id) or True)
+            self.assertEqual(seen2, ["b"])
+            self.assertEqual(results[0].strategy.id, "b")
+
+    def test_quick_scan_without_on_pass_and_no_stop_scans_everything(self):
+        tester, runner = self._tester()
+
+        def fake_test_one(strategy, settle_ms=800, cancel=None, canary_only=False):
+            return StrategyResult(strategy=strategy, score=100.0,
+                                  targets=[TargetResult("https://a", True, 10.0)])
+
+        with mock.patch.object(tester, "test_one", fake_test_one), \
+             mock.patch("app.strategies.preflight_check", lambda s: []):
+            results = tester.quick_scan([_strategy(x) for x in "abc"], max_scan=10,
+                                        stop_on_pass=False)
+        self.assertEqual(len(results), 3)
+
+    def test_test_all_on_pass_stops_early(self):
+        tester, runner = self._tester()
+
+        def fake_test_one(strategy, settle_ms=600, cancel=None):
+            ok = strategy.id == "b"
+            return StrategyResult(strategy=strategy, score=100.0 if ok else 0.0,
+                                  targets=[TargetResult("https://a", ok, 10.0)])
+
+        asked: list[str] = []
+        with mock.patch.object(tester, "test_one", fake_test_one), \
+             mock.patch("app.strategies.preflight_check", lambda s: []):
+            results = tester.test_all([_strategy("a"), _strategy("b"), _strategy("c")],
+                                      on_pass=lambda r: asked.append(r.strategy.id) or True)
+
+        self.assertEqual(asked, ["b"])  # only a fully-passing strategy is offered
+        self.assertEqual(results[0].strategy.id, "b")
+        self.assertEqual(len(results), 2)  # "c" was never reached
+
+    def test_test_all_on_pass_keep_searching_scans_everything(self):
+        tester, runner = self._tester()
+
+        def fake_test_one(strategy, settle_ms=600, cancel=None):
+            return StrategyResult(strategy=strategy, score=100.0,
+                                  targets=[TargetResult("https://a", True, 10.0)])
+
+        with mock.patch.object(tester, "test_one", fake_test_one), \
+             mock.patch("app.strategies.preflight_check", lambda s: []):
+            results = tester.test_all([_strategy(x) for x in "abc"],
+                                      on_pass=lambda r: False)
+        self.assertEqual(len(results), 3)
+
     def test_quick_scan_respects_max_scan(self):
         tester, runner = self._tester()
         seen: list[str] = []

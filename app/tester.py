@@ -176,9 +176,10 @@ class StrategyTester:
 
     # ---------- probing ----------
 
-    def _probe_target(self, url: str, weight: float, cancel: Optional[threading.Event]) -> TargetResult:
+    def _probe_target(self, url: str, weight: float, cancel: Optional[threading.Event],
+                      attempts: Optional[int] = None) -> TargetResult:
         last: TargetResult = TargetResult(url, False, 0.0, "no attempts", weight)
-        for _ in range(self._attempts):
+        for _ in range(attempts if attempts is not None else self._attempts):
             if cancel is not None and cancel.is_set():
                 last.error = "cancelled"
                 return last
@@ -189,13 +190,14 @@ class StrategyTester:
                 return tr
         return last
 
-    def _probe_many(self, pairs: Iterable[tuple[str, float]], cancel: Optional[threading.Event]) -> list[TargetResult]:
+    def _probe_many(self, pairs: Iterable[tuple[str, float]], cancel: Optional[threading.Event],
+                    attempts: Optional[int] = None) -> list[TargetResult]:
         pairs = list(pairs)
         if not pairs:
             return []
         workers = min(self._concurrency, len(pairs))
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(self._probe_target, url, weight, cancel) for url, weight in pairs]
+            futures = [pool.submit(self._probe_target, url, weight, cancel, attempts) for url, weight in pairs]
             out: list[TargetResult] = []
             for fut in futures:
                 try:
@@ -222,10 +224,11 @@ class StrategyTester:
             result.error = "cancelled"
             return result
 
-        # Phase 1: a canary subset. If every canary fails, the strategy is
-        # dead — no point spending another two minutes on the rest.
+        # Phase 1: a canary subset, one attempt per target — a dead strategy
+        # is detected at least twice as fast. If every canary fails, the
+        # strategy is dead — no point spending another two minutes on the rest.
         canary = self._targets[: min(CANARY_COUNT, len(self._targets))]
-        result.targets = self._probe_many(canary, cancel)
+        result.targets = self._probe_many(canary, cancel, attempts=1)
         if cancel is not None and cancel.is_set():
             self._runner.stop()
             result.error = "cancelled"
@@ -282,13 +285,19 @@ class StrategyTester:
                    progress_cb: Callable[[int, int, Strategy | None], None] | None = None,
                    cancel: Optional[threading.Event] = None,
                    stop_on_pass: bool = True,
-                   max_scan: int = 40) -> list[StrategyResult]:
+                   max_scan: int = 40,
+                   on_pass: Callable[[StrategyResult], bool] | None = None) -> list[StrategyResult]:
         """Cheap pass over the catalog: canaries only, stop at the first hit.
 
         With ~190 presets a honest full sweep takes minutes; most networks are
         covered by one of the first few strategies, so the autopilot tries them
         in order and stops as soon as one passes every canary. `max_scan`
         bounds the worst case when nothing passes.
+
+        `on_pass` is consulted when a strategy passes every canary: returning
+        True stops the scan, False keeps searching for a better one (the
+        callback is how the app asks "accept or keep searching?"). It takes
+        precedence over `stop_on_pass`.
         """
         from .strategies import preflight_check
 
@@ -307,10 +316,16 @@ class StrategyTester:
             results.append(result)
             if progress_cb:
                 progress_cb(i + 1, limit, s)
-            if stop_on_pass and result.ok_targets == result.total_targets and result.ok_targets > 0:
-                _log.info("quick scan: %s passed %d/%d canaries — stopping early",
-                          s.id, result.ok_targets, result.total_targets)
-                break
+            if result.ok_targets == result.total_targets and result.ok_targets > 0:
+                if on_pass is not None:
+                    if on_pass(result):
+                        _log.info("quick scan: %s accepted after %d/%d canaries — stopping early",
+                                  s.id, result.ok_targets, result.total_targets)
+                        break
+                elif stop_on_pass:
+                    _log.info("quick scan: %s passed %d/%d canaries — stopping early",
+                              s.id, result.ok_targets, result.total_targets)
+                    break
         if progress_cb:
             progress_cb(limit, limit, None)
         results.sort(key=lambda r: r.score, reverse=True)
@@ -318,7 +333,8 @@ class StrategyTester:
 
     def test_all(self, strategies: list[Strategy],
                  progress_cb: Callable[[int, int, Strategy | None], None] | None = None,
-                 cancel: Optional[threading.Event] = None) -> list[StrategyResult]:
+                 cancel: Optional[threading.Event] = None,
+                 on_pass: Callable[[StrategyResult], bool] | None = None) -> list[StrategyResult]:
         from .strategies import preflight_check
 
         results: list[StrategyResult] = []
@@ -347,9 +363,19 @@ class StrategyTester:
                 if progress_cb:
                     progress_cb(i + 1, total, s)
                 continue
-            results.append(self.test_one(s, cancel=cancel))
+            r = self.test_one(s, cancel=cancel)
+            results.append(r)
             if progress_cb:
                 progress_cb(i + 1, total, s)
+            # Early exit: a strategy that reaches every target is good enough
+            # to offer to the user; if they accept, no reason to sit through
+            # the remaining ~180 presets.
+            if (on_pass is not None and r.error == "" and r.total_targets > 0
+                    and r.ok_targets == r.total_targets):
+                if on_pass(r):
+                    _log.info("sweep: %s accepted early — skipping the remaining %d strategies",
+                              s.id, total - i - 1)
+                    break
         if progress_cb:
             progress_cb(total, total, None)
         results.sort(key=lambda r: r.score, reverse=True)

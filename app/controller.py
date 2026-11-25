@@ -24,8 +24,9 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from . import i18n, paths, toasts
 from .config import Config, load as load_config, save as save_config
-from .strategies import Strategy, StrategyRunner, load_strategies
+from .strategies import Strategy, StrategyRunner, diverse_order, load_strategies
 from .tester import StrategyTester, StrategyResult
+from .dns.advisor import DNSAdvisor, DNSRecommendation
 from .dns.manager import DNSManager
 from .health import HealthMonitor, HealthSnapshot
 from .logger import get as _log
@@ -53,9 +54,8 @@ class AppSnapshot:
     strategy_id: str = ""
     strategy_display: str = ""
     strategy_modes: str = ""
-    dns_name: str = ""
-    dns_rtt_ms: float = 0.0
-    dns_listen: str = ""
+    dns_recommend_name: str = ""
+    dns_recommend_rtt_ms: float = 0.0
     health_ok: int = 0
     health_total: int = 0
     health_rtt_ms: float = 0.0
@@ -71,6 +71,7 @@ class AppController(QObject):
     log_appended = pyqtSignal(list)     # new lines only
     strategies_loaded = pyqtSignal(list)  # list[Strategy]
     test_progress = pyqtSignal(int, int, str)
+    strategy_found = pyqtSignal(str, float)  # strategy id, score of the first pass
     toast_request = pyqtSignal(str, str)  # title, body
     update_finished = pyqtSignal(bool, str)  # ok, human message
     diagnostics_ready = pyqtSignal(object)  # DiagnosticReport
@@ -92,6 +93,7 @@ class AppController(QObject):
             preferred=self.config.doh_provider if self.config.doh_provider != "auto" else "",
             custom_url=self.config.doh_custom_url,
         )
+        self._dns_advisor = DNSAdvisor(on_update=self._on_dns_recommendation)
         self._health: Optional[HealthMonitor] = None
         self._state = State.IDLE
         self._strategies: list[Strategy] = []
@@ -102,6 +104,10 @@ class AppController(QObject):
         self._cancel = threading.Event()
         self._last_retest_at = 0.0
         self._diag_running = False
+        # "accept or keep searching" dialog state (worker thread <-> UI)
+        self._found_event = threading.Event()
+        self._found_accept = True
+        self._found_asked = False
 
         # Log lines are produced from worker threads (winws.exe stdout);
         # buffer them and hand the UI one batch per tick instead of one
@@ -128,6 +134,9 @@ class AppController(QObject):
             self._strategies = []
         _log.info("app initialised with %d usable strategies", len(self._strategies))
         self._load_cache()
+        # DNS is informational only: measure the resolvers once in the
+        # background and surface a recommendation.
+        self._dns_advisor.start()
         # Keep the Run key in sync with the config (and with the exe path,
         # which changes when the folder is moved).
         from . import autostart
@@ -206,14 +215,10 @@ class AppController(QObject):
         run_id = self._next_run()
         threading.Thread(target=self._switch_thread, args=(run_id, cancel, s), daemon=True).start()
 
-    def switch_dns(self, server_name: str) -> None:
-        # switch_upstream measures the new server's RTT — never do that on
-        # the UI thread.
-        threading.Thread(target=self._switch_dns_thread, args=(server_name,), daemon=True).start()
-
-    def _switch_dns_thread(self, server_name: str) -> None:
-        if self._dns.switch_upstream(server_name):
-            self._update_snapshot()
+    def answer_found(self, accept: bool) -> None:
+        """UI → worker: the user answered the "accept or keep searching" dialog."""
+        self._found_accept = bool(accept)
+        self._found_event.set()
 
     def export_log(self, target: Optional[Path] = None) -> Path:
         target = target or (
@@ -468,6 +473,44 @@ class AppController(QObject):
 
     # ---------- internal: testing ----------
 
+    def _cached_scores(self) -> dict[str, float]:
+        return {r.strategy.id: r.score for r in self._last_test if r.score > 0}
+
+    def _ask_found(self, result: StrategyResult) -> bool:
+        """Decide whether to stop the sweep at the first working strategy.
+
+        Returns True to stop and accept, False to keep searching. When the
+        user dialog is enabled we ask exactly once per sweep; no answer
+        within the timeout auto-accepts, so an unattended autopilot in the
+        tray is never stuck.
+        """
+        if not self.config.ask_on_found:
+            return True  # old behaviour: silently take the first pass
+        if self._found_asked:
+            return False  # the user already chose "keep searching" once
+        self._found_asked = True
+        timeout = max(5, int(self.config.ask_found_timeout_seconds))
+        with self._lock:
+            self._found_accept = True  # default answer
+            self._found_event = threading.Event()
+        self.strategy_found.emit(result.strategy.id, result.score)
+        ev = self._found_event
+        deadline = time.time() + timeout
+        while time.time() < deadline and not ev.wait(0.2):
+            if self._cancel.is_set():
+                return False  # Stop was pressed — the sweep will abort anyway
+        accepted = self._found_accept and not self._cancel.is_set()
+        _log.info("first pass %s (score %.1f): user chose %s",
+                  result.strategy.id, result.score,
+                  "accept" if accepted else "keep searching")
+        return accepted
+
+    def _on_dns_recommendation(self, rec: DNSRecommendation) -> None:
+        with self._lock:
+            self._snapshot.dns_recommend_name = rec.name
+            self._snapshot.dns_recommend_rtt_ms = rec.rtt_ms
+        self._emit_snapshot()
+
     def _progress_cb(self):
         def progress(i: int, n: int, s) -> None:
             label = s.id if isinstance(s, Strategy) else ""
@@ -482,11 +525,15 @@ class AppController(QObject):
         """Two-stage pick: canaries over the first N strategies, then a full
         verification of the winner."""
         self._tester.reload_targets()
+        self._found_asked = False
+        ordered = diverse_order(self._strategies, self._cached_scores())
+        _log.info("quick scan: first candidate is %s (diversity order)", ordered[0].id if ordered else "-")
         results = self._tester.quick_scan(
-            self._strategies,
+            ordered,
             progress_cb=self._progress_cb(),
             cancel=cancel,
-            stop_on_pass=True,
+            stop_on_pass=False,
+            on_pass=self._ask_found,
             max_scan=max(1, self.config.quick_scan_limit),
         )
         if cancel.is_set() or not self._is_current(run_id):
@@ -515,8 +562,13 @@ class AppController(QObject):
     def _run_full_test(self, run_id: int, cancel: threading.Event) -> list[StrategyResult]:
         self._set_state(State.TESTING)
         self._tester.reload_targets()  # pick up edits to utils/targets.txt
+        self._found_asked = False
+        ordered = diverse_order(self._strategies, self._cached_scores())
+        _log.info("full sweep: %d strategies, first candidate is %s (diversity order)",
+                  len(ordered), ordered[0].id if ordered else "-")
 
-        results = self._tester.test_all(self._strategies, progress_cb=self._progress_cb(), cancel=cancel)
+        results = self._tester.test_all(
+            ordered, progress_cb=self._progress_cb(), cancel=cancel, on_pass=self._ask_found)
         if not self._is_current(run_id):
             return results
         with self._lock:
@@ -660,16 +712,10 @@ class AppController(QObject):
                 self._snapshot.strategy_id = ""
                 self._snapshot.strategy_display = ""
                 self._snapshot.strategy_modes = ""
-            dns = self._dns.current
-            if dns:
-                self._snapshot.dns_name = dns.name
-                self._snapshot.dns_rtt_ms = dns.rtt_ms
-            else:
-                self._snapshot.dns_name = ""
-                self._snapshot.dns_rtt_ms = 0.0
-            self._snapshot.dns_listen = (
-                "system" if self.config.dns_mode == "system" else f"127.0.0.1:{self.config.dns_listen_port}"
-            )
+            rec = self._dns_advisor.recommendation
+            if rec:
+                self._snapshot.dns_recommend_name = rec.name
+                self._snapshot.dns_recommend_rtt_ms = rec.rtt_ms
         self._emit_snapshot()
 
     def _emit_snapshot(self) -> None:

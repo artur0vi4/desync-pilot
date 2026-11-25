@@ -82,6 +82,74 @@ GROUP_ORDER = {
 }
 
 
+def _sections_of(strategy: "Strategy") -> list[list[str]]:
+    if strategy.sections:
+        return strategy.sections
+    return [sec for sec in split_sections(list(strategy.raw_args)) if sec]
+
+
+def strategy_signature(strategy: "Strategy") -> tuple:
+    """Coarse fingerprint of *how* the strategy fights DPI.
+
+    For every traffic section we keep only the desync methods plus the
+    protocol it filters (TCP/UDP), ignoring payload .bin files, hostlists,
+    port lists and numeric tuning. Two strategies with the same signature
+    are parameter variants of the same technique — trying one of each
+    signature first covers the whole technique space much earlier than a
+    plain catalog order (in the bundled catalog the default order reaches
+    the last of ~50 signatures only at strategy #170).
+    """
+    sig: list[tuple[str, tuple[str, ...]]] = []
+    for sec in _sections_of(strategy):
+        link_bits: list[str] = []
+        methods: list[str] = []
+        for tok in sec:
+            if tok.startswith("--filter-tcp=") and tok.split("=", 1)[1]:
+                link_bits.append("T")
+            elif tok.startswith("--filter-udp=") and tok.split("=", 1)[1]:
+                link_bits.append("U")
+            elif tok.startswith("--dpi-desync="):
+                methods.extend(sorted(m for m in tok.split("=", 1)[1].split(",") if m))
+        if methods:
+            sig.append(("".join(sorted(set(link_bits))) or "any", tuple(sorted(methods))))
+    return tuple(sorted(set(sig)))
+
+
+def diverse_order(strategies: list["Strategy"],
+                  scores: Optional[dict[str, float]] = None) -> list["Strategy"]:
+    """Scan order: proven winners first, then one strategy per distinct
+    signature before repeating a signature (diversity-first).
+
+    The catalog is dominated by parameter variants of the same few
+    techniques, so a naive order can spend the first 40 tries inside two
+    families without ever touching the rest. Interleaving signatures makes
+    the early tries cover every family, which finds a working strategy in
+    far fewer attempts. `scores` (strategy id -> last test score) promotes
+    strategies that already worked on this network to the front.
+    """
+    scores = scores or {}
+    sig_of = {s.id: strategy_signature(s) for s in strategies}
+
+    boosted = sorted(
+        (s for s in strategies if scores.get(s.id, 0.0) > 0),
+        key=lambda s: scores.get(s.id, 0.0), reverse=True,
+    )
+    rest = [s for s in strategies if scores.get(s.id, 0.0) <= 0]
+
+    seen: set[tuple] = {sig_of[s.id] for s in boosted}
+    ordered: list["Strategy"] = []
+    while rest:
+        pick = 0  # fall back to catalog order when every signature is seen
+        for i, s in enumerate(rest):
+            if sig_of[s.id] not in seen:
+                pick = i
+                break
+        s = rest.pop(pick)
+        seen.add(sig_of[s.id])
+        ordered.append(s)
+    return boosted + ordered
+
+
 def load_strategies() -> list[Strategy]:
     """Load bundled strategies.json (or the upstream remote copy) and the
     community preset catalog, dropping entries whose argv is already present.

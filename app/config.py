@@ -29,6 +29,10 @@ class Config:
     preferred_strategy: str = ""  # "" = auto
     quick_scan: bool = True  # cheap canary pass instead of a full sweep on start
     quick_scan_limit: int = 40  # how many presets the quick pass may try
+    # offer to accept the first working strategy found instead of scanning on
+    # ask_found_timeout_seconds is how long the dialog waits before auto-accepting
+    ask_on_found: bool = True
+    ask_found_timeout_seconds: int = 45
     skip_groups: list = field(default_factory=lambda: ["experimental"])
     test_timeout_seconds: int = 8
     test_attempts: int = 2

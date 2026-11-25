@@ -44,6 +44,16 @@ class SettingsDialog(QDialog):
         self._quick_limit.setValue(config.quick_scan_limit)
         form.addRow(i18n.t("label.quick_scan_limit"), self._quick_limit)
 
+        # ask on the first working strategy found
+        self._ask_found = QCheckBox(i18n.t("label.ask_on_found"))
+        self._ask_found.setChecked(config.ask_on_found)
+        form.addRow(i18n.t("label.strategy_pick"), self._ask_found)
+
+        self._ask_timeout = QSpinBox()
+        self._ask_timeout.setRange(5, 300)
+        self._ask_timeout.setValue(config.ask_found_timeout_seconds)
+        form.addRow(i18n.t("label.ask_found_timeout"), self._ask_timeout)
+
         # recheck interval
         self._recheck = QSpinBox()
         self._recheck.setRange(5, 240)
@@ -139,6 +149,8 @@ class SettingsDialog(QDialog):
         c.auto_mode = self._auto.isChecked()
         c.quick_scan = self._quick.isChecked()
         c.quick_scan_limit = self._quick_limit.value()
+        c.ask_on_found = self._ask_found.isChecked()
+        c.ask_found_timeout_seconds = self._ask_timeout.value()
         c.recheck_every_minutes = self._recheck.value()
         c.results_ttl_minutes = self._cache_ttl.value()
         c.dns_mode = self._dns_mode.currentData()

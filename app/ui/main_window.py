@@ -1,23 +1,23 @@
-"""Main application window with four tabs: Status / Strategies / Log / About."""
+"""Main application window with five tabs: Status / Strategies / Diagnostics / Log / About."""
 from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
+    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QTableWidget, QTableWidgetItem, QTabWidget,
+    QVBoxLayout, QWidget,
 )
 
 from .. import i18n, logger, paths
 from ..controller import AppController, AppSnapshot, State
-from ..dns.servers import SERVERS
 from .resources import DARK_QSS, app_icon_svg
 from .tray import TrayIcon
-from .widgets import Badge, Card, KV
+from .widgets import Badge, Card, FlowLayout, KV
 from .settings_dialog import SettingsDialog
 
 STRATEGY_ID_ROLE = Qt.ItemDataRole.UserRole
@@ -40,8 +40,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._ctrl = controller
         self.setWindowTitle(i18n.t("app.title"))
-        self.resize(860, 620)
-        self.setMinimumSize(640, 480)
+        self.resize(920, 680)
+        self.setMinimumSize(700, 540)
         self._apply_window_icon()
         self.setStyleSheet(DARK_QSS)
 
@@ -72,8 +72,9 @@ class MainWindow(QMainWindow):
         root.addWidget(title)
         root.addWidget(sub)
 
-        # Toolbar
-        tb = QHBoxLayout()
+        # Toolbar — wraps onto a second row in a narrow window instead of
+        # squeezing the captions out of the buttons.
+        tb = FlowLayout(spacing=8)
         self._btn_start = QPushButton(i18n.t("btn.start"))
         self._btn_stop = QPushButton(i18n.t("btn.stop"))
         self._btn_stop.setProperty("variant", "danger")
@@ -86,7 +87,9 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._btn_start)
         tb.addWidget(self._btn_stop)
         tb.addWidget(self._btn_retest)
-        tb.addStretch()
+        stretch = QWidget()
+        stretch.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(stretch)
         tb.addWidget(self._btn_export)
         tb.addWidget(self._btn_settings)
         root.addLayout(tb)
@@ -122,6 +125,11 @@ class MainWindow(QMainWindow):
         self._ctrl.strategies_loaded.connect(self._on_strategies_loaded)
         self._ctrl.update_finished.connect(self._on_update_finished)
         self._ctrl.diagnostics_ready.connect(self._on_diagnostics)
+        self._ctrl.strategy_found.connect(self._on_strategy_found)
+
+        # id -> Strategy, rebuilt only when the catalog changes (used on every
+        # snapshot tick — rebuilding it per tick used to walk the whole list).
+        self._strat_index: dict = {}
 
         # Buttons
         self._btn_start.clicked.connect(self._ctrl.start)
@@ -135,7 +143,7 @@ class MainWindow(QMainWindow):
 
     @property
     def _strategies_by_id(self) -> dict:
-        return {s.id: s for s in self._ctrl.strategies()}
+        return self._strat_index
 
     # ---------- construction helpers ----------
 
@@ -155,64 +163,63 @@ class MainWindow(QMainWindow):
 
     def _build_status_tab(self) -> None:
         tab = QWidget()
-        v = QVBoxLayout(tab)
-        v.setSpacing(10)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        # The cards no longer have to fight for vertical space in a small
+        # window: everything scrolls, nothing gets squeezed or clipped.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body = QWidget()
+        v = QVBoxLayout(body)
+        v.setContentsMargins(2, 2, 2, 2)
+        v.setSpacing(12)
 
+        # --- current strategy (the hero row) ---
         c_strat = Card(i18n.t("group.current"))
-        self._kv_strat = KV(i18n.t("label.name"), "—")
+        self._lbl_strategy_big = QLabel("—")
+        self._lbl_strategy_big.setProperty("role", "value-big")
+        self._lbl_strategy_big.setWordWrap(True)
+        self._lbl_strategy_big.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        c_strat.addWidget(self._lbl_strategy_big)
         self._kv_group = KV(i18n.t("label.group"), "—")
         self._kv_modes = KV(i18n.t("label.modes"), "—")
-        c_strat.addWidget(self._kv_strat)
         c_strat.addWidget(self._kv_group)
         c_strat.addWidget(self._kv_modes)
         v.addWidget(c_strat)
 
-        c_dns = Card(i18n.t("group.dns"))
-        self._kv_dns = KV(i18n.t("label.name"), "—")
-        self._kv_dns_rtt = KV(i18n.t("label.score") + " (RTT)", "—")
-        self._kv_dns_listen = KV("Listen", "—")
-        c_dns.addWidget(self._kv_dns)
-        c_dns.addWidget(self._kv_dns_rtt)
-        c_dns.addWidget(self._kv_dns_listen)
-        # DNS selector
-        sel_row = QHBoxLayout()
-        sel_row.addWidget(QLabel("↳"))
-        self._dns_combo = QComboBox()
-        self._fill_dns_combo()
-        self._dns_combo.currentTextChanged.connect(self._ctrl.switch_dns)
-        sel_row.addWidget(self._dns_combo, 1)
-        c_dns.addLayout(sel_row)
-        v.addWidget(c_dns)
-
+        # --- connection health ---
         c_health = Card(i18n.t("group.health"))
-        self._kv_health = KV("Reachable", "—")
-        self._kv_health_rtt = KV("Avg RTT", "—")
+        self._kv_health = KV(i18n.t("label.reachable"), "—")
+        self._kv_health_rtt = KV(i18n.t("label.avg_rtt"), "—")
         c_health.addWidget(self._kv_health)
         c_health.addWidget(self._kv_health_rtt)
         v.addWidget(c_health)
 
+        # --- DNS recommendation (informational only) ---
+        c_dns = Card(i18n.t("group.dns"))
+        self._kv_dns_rec = KV(i18n.t("label.recommended"), "—")
+        self._kv_dns_rtt = KV(i18n.t("label.rtt"), "—")
+        c_dns.addWidget(self._kv_dns_rec)
+        c_dns.addWidget(self._kv_dns_rtt)
+        dns_hint = QLabel(i18n.t("label.dns_hint"))
+        dns_hint.setProperty("role", "hint")
+        dns_hint.setWordWrap(True)
+        c_dns.addWidget(dns_hint)
+        v.addWidget(c_dns)
+
+        # --- last test ---
         c_last = Card(i18n.t("group.last_test"))
         self._kv_tested_at = KV(i18n.t("label.tested_at"), "—")
-        self._kv_best = KV(i18n.t("label.score"), "—")
+        self._kv_best = KV(i18n.t("label.best"), "—")
         c_last.addWidget(self._kv_tested_at)
         c_last.addWidget(self._kv_best)
         v.addWidget(c_last)
 
         v.addStretch()
+        scroll.setWidget(body)
+        outer.addWidget(scroll)
         self._tabs.addTab(tab, i18n.t("tab.status"))
-
-    def _fill_dns_combo(self) -> None:
-        self._dns_combo.blockSignals(True)
-        current = self._dns_combo.currentText()
-        self._dns_combo.clear()
-        for s in SERVERS:
-            self._dns_combo.addItem(s.name)
-        if self._ctrl.config.doh_custom_url:
-            self._dns_combo.addItem("Custom")
-        idx = self._dns_combo.findText(current)
-        if idx >= 0:
-            self._dns_combo.setCurrentIndex(idx)
-        self._dns_combo.blockSignals(False)
 
     def _build_strategies_tab(self) -> None:
         tab = QWidget()
@@ -342,14 +349,13 @@ class MainWindow(QMainWindow):
             self._status_badge.style().unpolish(self._status_badge)
             self._status_badge.style().polish(self._status_badge)
 
-        self._kv_strat.set_value(snap.strategy_display or "—")
-        s = self._strategies_by_id.get(snap.strategy_id)
+        self._lbl_strategy_big.setText(snap.strategy_display or "—")
+        s = self._strat_index.get(snap.strategy_id)
         self._kv_group.set_value(s.group if s else "—")
         self._kv_modes.set_value(snap.strategy_modes or "—")
 
-        self._kv_dns.set_value(snap.dns_name or "—")
-        self._kv_dns_rtt.set_value(f"{snap.dns_rtt_ms:.0f} ms" if snap.dns_rtt_ms else "—")
-        self._kv_dns_listen.set_value(snap.dns_listen or "—")
+        self._kv_dns_rec.set_value(snap.dns_recommend_name or "—")
+        self._kv_dns_rtt.set_value(f"{snap.dns_recommend_rtt_ms:.0f} ms" if snap.dns_recommend_rtt_ms else "—")
 
         self._kv_health.set_value(f"{snap.health_ok}/{snap.health_total}" if snap.health_total else "—")
         self._kv_health_rtt.set_value(f"{snap.health_rtt_ms:.0f} ms" if snap.health_rtt_ms else "—")
@@ -395,8 +401,50 @@ class MainWindow(QMainWindow):
         if name:
             self._progress_label.setText(i18n.t("msg.testing_progress", i, n, name))
 
+    def _on_strategy_found(self, strategy_id: str, score: float) -> None:
+        """The sweep hit its first fully-working strategy and asks what to do.
+
+        Shown as a modal dialog with a countdown: no answer = accept, so an
+        unattended autopilot in the tray is never blocked.
+        """
+        self._show_and_raise()
+        body = i18n.t("msg.found_body", strategy_id, f"{score:.0f}")
+        remaining = max(5, int(self._ctrl.config.ask_found_timeout_seconds))
+
+        box = QMessageBox(self)
+        box.setWindowTitle(i18n.t("msg.found_title"))
+        box.setIcon(QMessageBox.Icon.Question)
+        accept_btn = box.addButton(i18n.t("msg.found_accept"), QMessageBox.ButtonRole.AcceptRole)
+        cont_btn = box.addButton(i18n.t("msg.found_continue"), QMessageBox.ButtonRole.NoRole)
+        cont_btn.setProperty("variant", "ghost")
+        cont_btn.style().unpolish(cont_btn)
+        cont_btn.style().polish(cont_btn)
+        box.setDefaultButton(accept_btn)
+        # Countdown: no answer within the timeout means "accept" — the same
+        # default the controller uses when the window is not looked at.
+        state = {"left": remaining}
+
+        def _tick() -> None:
+            state["left"] -= 1
+            if state["left"] > 0:
+                box.setText(f"{body}\n\n{i18n.t('msg.found_auto', state['left'])}")
+            else:
+                timer.stop()
+                box.accept()  # timeout = accept the found strategy
+
+        timer = QTimer(box)
+        timer.setInterval(1000)
+        timer.timeout.connect(_tick)
+        box.setText(f"{body}\n\n{i18n.t('msg.found_auto', state['left'])}")
+        timer.start()
+        box.exec()
+        timer.stop()
+        accepted = box.clickedButton() is not cont_btn
+        self._ctrl.answer_found(accepted)
+
     def _on_strategies_loaded(self, strategies) -> None:
         self._all_strategies = list(strategies)
+        self._strat_index = {s.id: s for s in self._all_strategies}
         groups = sorted({s.group for s in self._all_strategies})
         current = self._strat_group.currentData()
         self._strat_group.blockSignals(True)
@@ -554,7 +602,6 @@ class MainWindow(QMainWindow):
         ])
         if self._strat_group.count():
             self._strat_group.setItemText(0, i18n.t("label.all_groups"))
-        self._fill_dns_combo()
         for i in range(self._tabs.count()):
             tab_name = ["status", "strategies", "diagnostics", "log", "about"][i]
             self._tabs.setTabText(i, i18n.t(f"tab.{tab_name}"))
